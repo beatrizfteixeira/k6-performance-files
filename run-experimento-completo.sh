@@ -15,12 +15,23 @@
 #   /api/io       - workload com pg_sleep (DB)            [requer Postgres no host remoto]
 #
 # Variaveis de ambiente (override opcional dos defaults):
-#   REMOTE_HOST         (default: 178.238.235.114)  host onde rodam as apps WebFlux/MVC
-#   COLLECT_METRICS     (default: 0)     se 1, executa coleta-metricas.sh (precisa adaptar p/ SSH)
+#   REMOTE_HOST         (default: 172.31.45.57)  IP PRIVADO da maquina A (apps)
+#   SSH_HOST            (default: REMOTE_HOST)   host alvo do SSH (pode ser alias do ~/.ssh/config como 'apps')
+#   SSH_USER            (default: ec2-user)      usuario SSH na maquina A
+#   SSH_KEY             (default: ~/.ssh/id_ed25519_apps)  chave privada
+#   APP_CLASS_REMOTE    (default: detectado por framework)  classe Java a buscar com pgrep -f
+#   COLLECT_METRICS     (default: 0)     se 1, coleta CPU/MEM/threads/GC via SSH na maquina A
 #   WARMUP_VUS          (default: 70)    VUs durante a fase de warmup
 #   WARMUP_DURATION     (default: 60s)   duracao do warmup
 #   STEADY_DURATION     (default: 40s)   duracao da fase de medicao
 #   PAUSE_BETWEEN_REPS  (default: 90)    pausa em segundos entre repeticoes
+#
+# Coleta de metricas de sistema (COLLECT_METRICS=1):
+#   - O script SSH-a na maquina A
+#   - Detecta o PID da app (pgrep -f <APP_CLASS>)
+#   - Copia coleta-metricas.sh para /tmp/ na A (se ainda nao estiver la)
+#   - Dispara coleta em background na A (saida em /tmp/metricas_<vus>_<framework>_<rep>.csv)
+#   - Faz scp do CSV para a pasta de results local apos o k6 terminar
 #
 # Exemplo com overrides:
 #   WARMUP_VUS=1000 WARMUP_DURATION=10s STEADY_DURATION=50s \
@@ -43,12 +54,20 @@ REPS=${3:-2}
 NOME_BASE=${4:-experimento}
 ENDPOINT=${5:-/api/io-http}
 
-REMOTE_HOST=${REMOTE_HOST:-15.229.42.145}
+REMOTE_HOST=${REMOTE_HOST:-172.31.45.57}
+SSH_HOST=${SSH_HOST:-${REMOTE_HOST}}
+SSH_USER=${SSH_USER:-ec2-user}
+SSH_KEY=${SSH_KEY:-$HOME/.ssh/id_ed25519_apps}
 COLLECT_METRICS=${COLLECT_METRICS:-0}
 WARMUP_VUS=${WARMUP_VUS:-70}
 WARMUP_DURATION=${WARMUP_DURATION:-60s}
 STEADY_DURATION=${STEADY_DURATION:-40s}
 PAUSE_BETWEEN_REPS=${PAUSE_BETWEEN_REPS:-90}
+
+readonly SSH_OPTS=(-i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes)
+ssh_a() { ssh "${SSH_OPTS[@]}" "${SSH_USER}@${SSH_HOST}" "$@"; }
+scp_from_a() { scp "${SSH_OPTS[@]}" "${SSH_USER}@${SSH_HOST}:$1" "$2"; }
+scp_to_a() { scp "${SSH_OPTS[@]}" "$1" "${SSH_USER}@${SSH_HOST}:$2"; }
 
 if [[ -z "$FRAMEWORK" ]]; then
   echo "Uso: $0 <mvc|webflux> <vus> <reps> <nome_base> [endpoint]"
@@ -61,18 +80,19 @@ case "$FRAMEWORK" in
   mvc)
     BASE_URL="http://${REMOTE_HOST}:8080"
     APP_PORT="8080"
-    APP_CLASS="MvcIoApplication"
+    APP_CLASS_DEFAULT="MvcIoApplication"
     ;;
   webflux)
     BASE_URL="http://${REMOTE_HOST}:8081"
     APP_PORT="8081"
-    APP_CLASS="WebFluxIoApplication"
+    APP_CLASS_DEFAULT="WebFluxIoApplication"
     ;;
   *)
     echo "ERRO: framework deve ser 'mvc' ou 'webflux'"
     exit 1
     ;;
 esac
+APP_CLASS_REMOTE=${APP_CLASS_REMOTE:-$APP_CLASS_DEFAULT}
 
 if ! curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE_URL$ENDPOINT" | grep -q '^2'; then
   HTTP_CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE_URL$ENDPOINT" || echo "000")
@@ -92,11 +112,41 @@ echo "Coleta: $FRAMEWORK | VUs steady: $VUS | Reps: $REPS"
 echo "Warmup: ${WARMUP_VUS} VUs por ${WARMUP_DURATION} | Steady: ${STEADY_DURATION}"
 echo "Pausa entre reps: ${PAUSE_BETWEEN_REPS}s"
 echo "Alvo: $BASE_URL$ENDPOINT (host remoto: ${REMOTE_HOST})"
-echo "Coleta de metricas de sistema: $([[ "$COLLECT_METRICS" == "1" ]] && echo "ATIVA" || echo "DESATIVADA (use COLLECT_METRICS=1 para ativar; precisa adaptar coleta-metricas.sh para SSH)")"
+if [[ "$COLLECT_METRICS" == "1" ]]; then
+  echo "Coleta de metricas de sistema: ATIVA (via SSH em ${SSH_USER}@${SSH_HOST}, classe '${APP_CLASS_REMOTE}')"
+else
+  echo "Coleta de metricas de sistema: DESATIVADA (use COLLECT_METRICS=1 para ativar)"
+fi
 echo "Pasta: $OUTPUT_DIR"
 echo "==========================================="
 
 DURACAO_TOTAL=$(( $(echo "$WARMUP_DURATION" | tr -d 's') + $(echo "$STEADY_DURATION" | tr -d 's') + 5 ))
+
+REMOTE_COLETA_PATH="/tmp/coleta-metricas.sh"
+
+if [[ "$COLLECT_METRICS" == "1" ]]; then
+  echo "Verificando SSH com a maquina A (${SSH_USER}@${SSH_HOST})..."
+  if ! ssh_a "echo OK" >/dev/null 2>&1; then
+    echo "ERRO: SSH para ${SSH_USER}@${SSH_HOST} falhou."
+    echo "  Verifique chave (${SSH_KEY}) e conectividade. Abortando."
+    exit 1
+  fi
+
+  echo "Copiando coleta-metricas.sh para a maquina A (${REMOTE_COLETA_PATH})..."
+  if ! scp_to_a "${SCRIPT_DIR}/coleta-metricas.sh" "${REMOTE_COLETA_PATH}"; then
+    echo "ERRO: scp do coleta-metricas.sh para a maquina A falhou. Abortando."
+    exit 1
+  fi
+  ssh_a "chmod +x ${REMOTE_COLETA_PATH}"
+
+  REMOTE_PID=$(ssh_a "pgrep -f '${APP_CLASS_REMOTE}' | head -1" || true)
+  if [[ -z "$REMOTE_PID" ]]; then
+    echo "ERRO: nao encontrei processo Java com classe '${APP_CLASS_REMOTE}' na maquina A."
+    echo "  Verifique se a app esta rodando ou ajuste APP_CLASS_REMOTE."
+    exit 1
+  fi
+  echo "PID da app ${FRAMEWORK} na maquina A: ${REMOTE_PID}"
+fi
 
 for r in $(seq 1 "$REPS"); do
   echo
@@ -104,13 +154,16 @@ for r in $(seq 1 "$REPS"); do
 
   K6_OUT="$OUTPUT_DIR/io_${VUS}_${FRAMEWORK}_${r}.csv"
   METRICAS_OUT="$OUTPUT_DIR/metricas_${VUS}_${FRAMEWORK}_${r}.csv"
+  REMOTE_METRICAS_TMP="/tmp/metricas_${VUS}_${FRAMEWORK}_${r}_$$.csv"
 
-  METRICAS_BG_PID=""
   if [[ "$COLLECT_METRICS" == "1" ]]; then
-    # TODO: adaptar coleta-metricas.sh para rodar via SSH na Maquina A (REMOTE_HOST)
-    # Hoje ele coleta do PID local; rodar localmente nao faz sentido com app remota.
-    "${SCRIPT_DIR}/coleta-metricas.sh" "$METRICAS_OUT" "$PID" "$DURACAO_TOTAL" &
-    METRICAS_BG_PID=$!
+    REMOTE_PID=$(ssh_a "pgrep -f '${APP_CLASS_REMOTE}' | head -1" || true)
+    if [[ -z "$REMOTE_PID" ]]; then
+      echo "ERRO: PID da app ${FRAMEWORK} sumiu na maquina A. Abortando."
+      exit 1
+    fi
+    echo "Disparando coleta de metricas na maquina A (PID=${REMOTE_PID}, ${DURACAO_TOTAL}s)..."
+    ssh_a "nohup ${REMOTE_COLETA_PATH} ${REMOTE_METRICAS_TMP} ${REMOTE_PID} ${DURACAO_TOTAL} >/tmp/coleta_${$}_${r}.log 2>&1 &"
   fi
 
   echo "Iniciando k6..."
@@ -124,8 +177,16 @@ for r in $(seq 1 "$REPS"); do
     --out csv="$K6_OUT" \
     "${SCRIPT_DIR}/scriptk6.js"
 
-  if [[ -n "$METRICAS_BG_PID" ]]; then
-    wait "$METRICAS_BG_PID" 2>/dev/null || true
+  if [[ "$COLLECT_METRICS" == "1" ]]; then
+    echo "Aguardando coleta de metricas finalizar na maquina A..."
+    ssh_a "while pgrep -f 'coleta-metricas.sh ${REMOTE_METRICAS_TMP}' >/dev/null 2>&1; do sleep 1; done" || true
+
+    echo "Trazendo metricas da maquina A..."
+    if scp_from_a "${REMOTE_METRICAS_TMP}" "${METRICAS_OUT}"; then
+      ssh_a "rm -f ${REMOTE_METRICAS_TMP}" || true
+    else
+      echo "AVISO: falha ao trazer ${REMOTE_METRICAS_TMP} da maquina A."
+    fi
   fi
 
   echo "Rep $r concluida"
