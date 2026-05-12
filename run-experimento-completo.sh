@@ -155,6 +155,8 @@ for r in $(seq 1 "$REPS"); do
   K6_OUT="$OUTPUT_DIR/io_${VUS}_${FRAMEWORK}_${r}.csv"
   METRICAS_OUT="$OUTPUT_DIR/metricas_${VUS}_${FRAMEWORK}_${r}.csv"
   REMOTE_METRICAS_TMP="/tmp/metricas_${VUS}_${FRAMEWORK}_${r}_$$.csv"
+  REMOTE_DONE_FLAG="${REMOTE_METRICAS_TMP}.done"
+  REMOTE_LOG="/tmp/coleta_${$}_${r}.log"
 
   if [[ "$COLLECT_METRICS" == "1" ]]; then
     REMOTE_PID=$(ssh_a "pgrep -f '${APP_CLASS_REMOTE}' | head -1" || true)
@@ -163,7 +165,13 @@ for r in $(seq 1 "$REPS"); do
       exit 1
     fi
     echo "Disparando coleta de metricas na maquina A (PID=${REMOTE_PID}, ${DURACAO_TOTAL}s)..."
-    ssh_a "nohup ${REMOTE_COLETA_PATH} ${REMOTE_METRICAS_TMP} ${REMOTE_PID} ${DURACAO_TOTAL} >/tmp/coleta_${$}_${r}.log 2>&1 &"
+    ssh_a "rm -f ${REMOTE_METRICAS_TMP} ${REMOTE_DONE_FLAG} ${REMOTE_LOG}; \
+           setsid bash -c '${REMOTE_COLETA_PATH} ${REMOTE_METRICAS_TMP} ${REMOTE_PID} ${DURACAO_TOTAL} >${REMOTE_LOG} 2>&1; touch ${REMOTE_DONE_FLAG}' </dev/null >/dev/null 2>&1 &"
+    sleep 2
+    if ! ssh_a "test -f ${REMOTE_METRICAS_TMP}"; then
+      echo "AVISO: CSV de metricas ainda nao apareceu na A apos 2s. Log:"
+      ssh_a "cat ${REMOTE_LOG} 2>/dev/null || echo '(sem log)'"
+    fi
   fi
 
   echo "Iniciando k6..."
@@ -178,14 +186,27 @@ for r in $(seq 1 "$REPS"); do
     "${SCRIPT_DIR}/scriptk6.js"
 
   if [[ "$COLLECT_METRICS" == "1" ]]; then
-    echo "Aguardando coleta de metricas finalizar na maquina A..."
-    ssh_a "while pgrep -f 'coleta-metricas.sh ${REMOTE_METRICAS_TMP}' >/dev/null 2>&1; do sleep 1; done" || true
+    echo "Aguardando coleta de metricas finalizar na maquina A (timeout: ${DURACAO_TOTAL}s + 30s)..."
+    WAIT_ELAPSED=0
+    WAIT_MAX=$(( DURACAO_TOTAL + 30 ))
+    while [[ $WAIT_ELAPSED -lt $WAIT_MAX ]]; do
+      if ssh_a "test -f ${REMOTE_DONE_FLAG}" 2>/dev/null; then
+        break
+      fi
+      sleep 2
+      WAIT_ELAPSED=$((WAIT_ELAPSED + 2))
+    done
+    if [[ $WAIT_ELAPSED -ge $WAIT_MAX ]]; then
+      echo "AVISO: timeout esperando coleta finalizar na A. Vou pegar o que tiver."
+    fi
 
     echo "Trazendo metricas da maquina A..."
     if scp_from_a "${REMOTE_METRICAS_TMP}" "${METRICAS_OUT}"; then
-      ssh_a "rm -f ${REMOTE_METRICAS_TMP}" || true
+      ssh_a "rm -f ${REMOTE_METRICAS_TMP} ${REMOTE_DONE_FLAG} ${REMOTE_LOG}" || true
     else
       echo "AVISO: falha ao trazer ${REMOTE_METRICAS_TMP} da maquina A."
+      echo "Log da coleta na A:"
+      ssh_a "cat ${REMOTE_LOG} 2>/dev/null || echo '(sem log)'"
     fi
   fi
 
