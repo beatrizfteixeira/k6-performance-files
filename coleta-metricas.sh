@@ -3,7 +3,10 @@
 #
 # Colunas geradas:
 #   timestamp        - epoch unix
-#   cpu_pct          - %CPU acumulada do processo (ps)
+#   cpu_pct          - %CPU INSTANTANEA do processo (delta de jiffies em /proc/PID/stat
+#                      vs /proc/stat). Estilo top/htop:
+#                        100% = 1 core saturado
+#                        N*100% = todos os N cores saturados (N = nproc)
 #   mem_rss_kb       - memoria fisica residente (ps)
 #   mem_vsz_kb       - memoria virtual (ps)
 #   threads_total    - numero de threads do processo (/proc/PID/task)
@@ -46,6 +49,23 @@ if command -v jstat >/dev/null 2>&1; then
   fi
 fi
 
+readonly CLK_TCK=$(getconf CLK_TCK)
+readonly NUM_CORES=$(nproc)
+
+cpu_jiffies_proc() {
+  local pid=$1
+  local stat
+  stat=$(cat "/proc/${pid}/stat" 2>/dev/null) || { echo "0"; return; }
+  local utime stime
+  utime=$(echo "$stat" | awk '{print $14}')
+  stime=$(echo "$stat" | awk '{print $15}')
+  echo $(( utime + stime ))
+}
+
+cpu_jiffies_total() {
+  awk '/^cpu /{sum=0; for (i=2; i<=NF; i++) sum+=$i; print sum; exit}' /proc/stat
+}
+
 if [[ $JSTAT_AVAILABLE -eq 1 ]]; then
   echo "Coletando metricas (CPU + RAM + threads + GC + heap) do PID $TARGET_PID por ${DURATION}s"
 else
@@ -53,8 +73,14 @@ else
   echo "AVISO: jstat indisponivel - colunas de GC/heap ficarao vazias"
 fi
 echo "Saida: $OUTPUT_FILE"
+echo "Cores: ${NUM_CORES} | CLK_TCK: ${CLK_TCK}"
+echo "cpu_pct = uso INSTANTANEO acumulado entre cores"
+echo "  100% = 1 core saturado | ${NUM_CORES}00% = todos os ${NUM_CORES} cores saturados"
 
 echo "timestamp,cpu_pct,mem_rss_kb,mem_vsz_kb,threads_total,ygc,ygc_time_s,fgc,fgc_time_s,heap_used_kb,heap_capacity_kb,metaspace_used_kb" > "$OUTPUT_FILE"
+
+PREV_PROC=$(cpu_jiffies_proc "$TARGET_PID")
+PREV_TOTAL=$(cpu_jiffies_total)
 
 END_TIME=$(($(date +%s) + DURATION))
 
@@ -66,10 +92,21 @@ while [[ $(date +%s) -lt $END_TIME ]]; do
 
   TS=$(date +%s)
 
-  STATS=$(ps -p "$TARGET_PID" -o pcpu=,rss=,vsz= 2>/dev/null || echo "0 0 0")
-  CPU=$(echo "$STATS" | awk '{print $1}')
-  RSS=$(echo "$STATS" | awk '{print $2}')
-  VSZ=$(echo "$STATS" | awk '{print $3}')
+  CUR_PROC=$(cpu_jiffies_proc "$TARGET_PID")
+  CUR_TOTAL=$(cpu_jiffies_total)
+  DELTA_PROC=$((CUR_PROC - PREV_PROC))
+  DELTA_TOTAL=$((CUR_TOTAL - PREV_TOTAL))
+  if [[ $DELTA_TOTAL -gt 0 ]]; then
+    CPU=$(awk -v dp="$DELTA_PROC" -v dt="$DELTA_TOTAL" -v nc="$NUM_CORES" 'BEGIN{printf "%.2f", (dp/dt)*nc*100}')
+  else
+    CPU="0.00"
+  fi
+  PREV_PROC=$CUR_PROC
+  PREV_TOTAL=$CUR_TOTAL
+
+  STATS=$(ps -p "$TARGET_PID" -o rss=,vsz= 2>/dev/null || echo "0 0")
+  RSS=$(echo "$STATS" | awk '{print $1}')
+  VSZ=$(echo "$STATS" | awk '{print $2}')
 
   THREADS=$(ls /proc/"$TARGET_PID"/task 2>/dev/null | wc -l)
 

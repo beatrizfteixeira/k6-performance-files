@@ -12,10 +12,21 @@
 #
 # Endpoints disponiveis:
 #   /api/io-http  - workload com chamada HTTP downstream  [default]
-#   /api/io       - workload com pg_sleep (DB)            [requer Postgres no host remoto]
+#   /api/io       - workload com pg_sleep (DB)            [requer Postgres acessivel pela app]
+#
+# Modulos separados (portas default):
+#   app-mvc-io-http       -> MVC_APP_PORT=8080, endpoint /api/io-http, APP_CLASS_REMOTE=MvcIoHttpApplication
+#   app-mvc-io-db         -> MVC_APP_PORT=8082, endpoint /api/io,      APP_CLASS_REMOTE=MvcIoDbApplication
+#   app-webflux-io-http   -> WEBFLUX_APP_PORT=8081, /api/io-http,      WebFluxIoHttpApplication
+#   app-webflux-io-db     -> WEBFLUX_APP_PORT=8083, /api/io,           WebFluxIoDbApplication
+#
+# Exemplo cenario PostgreSQL (MVC DB na maquina A, porta 8082):
+#   MVC_APP_PORT=8082 ./run-experimento-completo.sh mvc 1500 3 mvc_db_pg /api/io
 #
 # Variaveis de ambiente (override opcional dos defaults):
 #   REMOTE_HOST         (default: 172.31.45.57)  IP PRIVADO da maquina A (apps)
+#   MVC_APP_PORT        (default: 8080)  porta onde o MVC responde (http ou db)
+#   WEBFLUX_APP_PORT    (default: 8081)  porta onde o WebFlux responde (http ou db)
 #   SSH_HOST            (default: REMOTE_HOST)   host alvo do SSH (pode ser alias do ~/.ssh/config como 'apps')
 #   SSH_USER            (default: ec2-user)      usuario SSH na maquina A
 #   SSH_KEY             (default: ~/.ssh/id_ed25519_apps)  chave privada
@@ -39,8 +50,8 @@
 #
 # Pre-requisitos:
 #   - App Java ja em execucao no host remoto: ${REMOTE_HOST}
-#       MVC      -> porta 8080
-#       WebFlux  -> porta 8081
+#       MVC      -> porta ${MVC_APP_PORT:-8080} (ou 8082 se app-mvc-io-db)
+#       WebFlux  -> porta ${WEBFLUX_APP_PORT:-8081} (ou 8083 se app-webflux-io-db)
 #   - k6 instalado nesta maquina (gerador de carga)
 #   - Endpoint do experimento respondendo 2xx em http://${REMOTE_HOST}:<porta><endpoint>
 #
@@ -55,6 +66,8 @@ NOME_BASE=${4:-experimento}
 ENDPOINT=${5:-/api/io-http}
 
 REMOTE_HOST=${REMOTE_HOST:-172.31.45.57}
+MVC_APP_PORT=${MVC_APP_PORT:-8080}
+WEBFLUX_APP_PORT=${WEBFLUX_APP_PORT:-8081}
 SSH_HOST=${SSH_HOST:-${REMOTE_HOST}}
 SSH_USER=${SSH_USER:-ec2-user}
 SSH_KEY=${SSH_KEY:-$HOME/.ssh/id_ed25519_apps}
@@ -78,14 +91,22 @@ fi
 
 case "$FRAMEWORK" in
   mvc)
-    BASE_URL="http://${REMOTE_HOST}:8080"
-    APP_PORT="8080"
-    APP_CLASS_DEFAULT="MvcIoApplication"
+    APP_PORT="${MVC_APP_PORT}"
+    BASE_URL="http://${REMOTE_HOST}:${APP_PORT}"
+    if [[ "$ENDPOINT" == "/api/io" ]]; then
+      APP_CLASS_DEFAULT="MvcIoDbApplication"
+    else
+      APP_CLASS_DEFAULT="MvcIoHttpApplication"
+    fi
     ;;
   webflux)
-    BASE_URL="http://${REMOTE_HOST}:8081"
-    APP_PORT="8081"
-    APP_CLASS_DEFAULT="WebFluxIoApplication"
+    APP_PORT="${WEBFLUX_APP_PORT}"
+    BASE_URL="http://${REMOTE_HOST}:${APP_PORT}"
+    if [[ "$ENDPOINT" == "/api/io" ]]; then
+      APP_CLASS_DEFAULT="WebFluxIoDbApplication"
+    else
+      APP_CLASS_DEFAULT="WebFluxIoHttpApplication"
+    fi
     ;;
   *)
     echo "ERRO: framework deve ser 'mvc' ou 'webflux'"

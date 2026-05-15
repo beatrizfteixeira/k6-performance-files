@@ -31,13 +31,15 @@ fi
 
 case "$FRAMEWORK" in
   mvc)
-    APP_DIR="${PROJETO_ROOT}/app-mvc-io"
+    APP_DIR="${PROJETO_ROOT}/app-mvc-io-http"
     APP_PORT="8080"
+    APP_MAIN_CLASS="MvcIoHttpApplication"
     EXTRA_ARGS="--server.tomcat.threads.max=${TOMCAT_THREADS_MAX}"
     ;;
   webflux)
-    APP_DIR="${PROJETO_ROOT}/app-webflux-io"
+    APP_DIR="${PROJETO_ROOT}/app-webflux-io-http"
     APP_PORT="8081"
+    APP_MAIN_CLASS="WebFluxIoHttpApplication"
     EXTRA_ARGS=""
     ;;
   *)
@@ -108,7 +110,7 @@ cleanup() {
     fi
   fi
 
-  pkill -f "${FRAMEWORK^}IoApplication" 2>/dev/null || true
+  pkill -f "${APP_MAIN_CLASS}" 2>/dev/null || true
 
   echo
   echo "Publicando no Git..."
