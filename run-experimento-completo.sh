@@ -248,10 +248,33 @@ echo "==========================================="
 echo "Filtrando CSVs do k6 (steady + duration_ms)..."
 echo "==========================================="
 
+split_if_large() {
+  local csv_file="$1"
+  local limit_mb=100
+  local size_mb
+  size_mb=$(du -m "$csv_file" | cut -f1)
+  (( size_mb <= limit_mb )) && return 0
+
+  local header total_lines half base part1 part2
+  header=$(head -1 "$csv_file")
+  total_lines=$(( $(wc -l < "$csv_file") - 1 ))
+  half=$(( (total_lines + 1) / 2 ))
+  base="${csv_file%.csv}"
+  part1="${base}_part1.csv"
+  part2="${base}_part2.csv"
+
+  { echo "$header"; sed -n "2,$((half + 1))p" "$csv_file"; } > "$part1"
+  { echo "$header"; tail -n +"$((half + 2))" "$csv_file"; } > "$part2"
+  rm "$csv_file"
+
+  echo "  Dividido (${size_mb}MB > ${limit_mb}MB): $(basename "$csv_file") -> $(basename "$part1") ($(du -h "$part1" | cut -f1)) + $(basename "$part2") ($(du -h "$part2" | cut -f1))"
+}
+
 if [[ -x "${SCRIPT_DIR}/filter-csv.sh" ]]; then
   for csv_in in "$OUTPUT_DIR"/io_*.csv; do
     [[ -f "$csv_in" ]] || continue
     "${SCRIPT_DIR}/filter-csv.sh" --inplace "$csv_in"
+    split_if_large "$csv_in"
   done
 else
   echo "AVISO: filter-csv.sh nao encontrado ou sem permissao de execucao"
