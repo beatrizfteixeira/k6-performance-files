@@ -250,7 +250,7 @@ echo "==========================================="
 
 split_if_large() {
   local csv_file="$1"
-  local limit_mb=100
+  local limit_mb=50
   local size_mb
   size_mb=$(du -m "$csv_file" | cut -f1)
   (( size_mb <= limit_mb )) && return 0
